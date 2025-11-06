@@ -3,14 +3,16 @@ import os
 import cv2
 import numpy as np
 import torch
+from transformers import AutoProcessor, SiglipVisionModel
 from trackers.tracker import Tracker
-from team_assigner.team_classifier import TeamClassifier
+from team_assigner.team_classifier import TeamAssigner
 from development_and_analysis.k_means_custom import CustomKMeans
 
 def main():
     # Initialize components
-    tracker = Tracker('models/best1.pt')  # Your model path
-    team_classifier = TeamClassifier()  # Initialize with appropriate parameters
+    tracker = Tracker('models/best2.pt')  # Your model path
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    team_assigner = TeamAssigner(device=device)  # Initialize with device parameter
     kmeans = CustomKMeans(n_clusters=2)  # For team classification
 
     video_path = "input_videos/sample1.mp4"  # Update with your video path
@@ -45,8 +47,15 @@ def main():
             # Get detections and tracks using tracker
             tracks = tracker.update(frame)
 
-            # Process tracks and classify teams
-            # TODO: Add your team classification logic here
+            # Extract player crops and assign teams
+            if 'players' in tracks:
+                player_bboxes = [track_info["bbox"] for track_info in tracks['players'].values()]
+                if player_bboxes:
+                    # Extract and classify team
+                    player_crops = team_assigner.extract_player_crops(frame, player_bboxes)
+                    features = team_assigner.extract_features(list(tracks['players'].keys()), player_crops)
+                    reduced_features = team_assigner.reduce_dimensionality(features)
+                    team_labels = team_assigner.assign_teams(reduced_features)
             
             # Draw annotations on the frame
             annotated_frame = tracker.draw_annotations(frame, tracks, [])  # Empty list for team_ball_control for now
