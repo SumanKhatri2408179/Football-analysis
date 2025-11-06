@@ -9,11 +9,11 @@ from development_and_analysis.k_means_custom import CustomKMeans
 
 def main():
     # Initialize components
-    tracker = Tracker('models/best2.pt')  # Your model path
+    tracker = Tracker('models/best1.pt')  # Your model path
     team_classifier = TeamClassifier()  # Initialize with appropriate parameters
     kmeans = CustomKMeans(n_clusters=2)  # For team classification
 
-    video_path = "input_videos/your_video.mp4"  # Update with your video path
+    video_path = "input_videos/sample1.mp4"  # Update with your video path
     
     # Read video
     cap = cv2.VideoCapture(video_path)
