@@ -1,0 +1,12 @@
+ultralytics
+supervision
+pandas
+numpy
+torch
+torchvision
+opencv-python
+transformers
+more-itertools
+typing-extensions
+fastapi
+uvicorn
