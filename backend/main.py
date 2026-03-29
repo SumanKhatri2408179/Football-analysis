@@ -1126,6 +1126,9 @@ import cv2
 import uvicorn
 import numpy as np
 import torch
+import threading
+import time
+from collections import deque
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1136,12 +1139,12 @@ from player_ball_assigner import PlayerBallAssigner
 from camera_movement_estimator import CameraMovementEstimator
 from view_transformer import ViewTransformer
 from speed_and_distance_estimator import SpeedAndDistance_Estimator
+from ultralytics import YOLO
 import logging
 import aiofiles
 import ffmpeg
 import traceback
 import shutil
-import time
 
 # --------------------------
 # FastAPI App
@@ -1158,12 +1161,12 @@ app.add_middleware(
 )
 
 # Directories
-input_videos_dir = "input_videos"
+input_videos_dir  = "input_videos"
 output_videos_dir = "output_videos"
-stubs_dir = "stubs"
-os.makedirs(input_videos_dir, exist_ok=True)
+stubs_dir         = "stubs"
+os.makedirs(input_videos_dir,  exist_ok=True)
 os.makedirs(output_videos_dir, exist_ok=True)
-os.makedirs(stubs_dir, exist_ok=True)
+os.makedirs(stubs_dir,         exist_ok=True)
 
 # Chunk size for streaming
 CHUNK_SIZE = 1024 * 1024
@@ -1172,30 +1175,250 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Video Processing
+# Live Tracking — Global State
 # --------------------------
+live_model     = YOLO("models/best1.pt")   # reuse your existing model
+stream_active  = False
+latest_frame   = None
+frame_lock     = threading.Lock()
+tracking_data  = []
+ball_trail     = deque(maxlen=25)          # stores last 25 ball positions
+
+# Colours (BGR)
+COLOR_PLAYER  = (0,   255,   0)   # Green
+COLOR_BALL    = (0,   255, 255)   # Yellow
+COLOR_REFEREE = (255, 165,   0)   # Orange
+COLOR_TRAIL   = (0,   200, 255)   # Light yellow trail
+
+
+# --------------------------
+# Live Tracking — Draw Helpers
+# --------------------------
+
+def draw_ball_trail(frame):
+    """Draw a fading trail behind the ball showing its recent path."""
+    for i in range(1, len(ball_trail)):
+        if ball_trail[i - 1] is None or ball_trail[i] is None:
+            continue
+        thickness = max(1, int(np.sqrt(25 / float(i + 1)) * 2))
+        cv2.line(frame, ball_trail[i - 1], ball_trail[i], COLOR_TRAIL, thickness)
+
+
+def draw_player(frame, x1, y1, x2, y2, conf):
+    """Draw player bounding box with confidence label."""
+    cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_PLAYER, 2)
+    label = f"Player {conf:.0%}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), COLOR_PLAYER, -1)
+    cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    cv2.circle(frame, (cx, cy), 3, COLOR_PLAYER, -1)
+
+
+def draw_ball(frame, x1, y1, x2, y2, conf):
+    """Draw ball with circle, crosshair and trail."""
+    cx     = (x1 + x2) // 2
+    cy     = (y1 + y2) // 2
+    radius = max((x2 - x1), (y2 - y1)) // 2 + 4
+
+    # Add position to trail
+    ball_trail.append((cx, cy))
+
+    # Draw trail first (behind the ball)
+    draw_ball_trail(frame)
+
+    # Outer glow
+    cv2.circle(frame, (cx, cy), radius + 4, COLOR_BALL, 1)
+    # Main circle
+    cv2.circle(frame, (cx, cy), radius, COLOR_BALL, 3)
+    # Crosshair
+    cv2.line(frame, (cx - radius - 8, cy), (cx + radius + 8, cy), COLOR_BALL, 1)
+    cv2.line(frame, (cx, cy - radius - 8), (cx, cy + radius + 8), COLOR_BALL, 1)
+
+    # Label above ball
+    label = f"Ball {conf:.0%}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    cv2.rectangle(frame,
+                  (cx - tw // 2 - 4, y1 - th - 12),
+                  (cx + tw // 2 + 4, y1 - 4),
+                  COLOR_BALL, -1)
+    cv2.putText(frame, label,
+                (cx - tw // 2, y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+
+def draw_referee(frame, x1, y1, x2, y2, conf):
+    """Draw referee bounding box."""
+    cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_REFEREE, 2)
+    label = f"Referee {conf:.0%}"
+    cv2.putText(frame, label, (x1, y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_REFEREE, 2)
+
+
+# --------------------------
+# Live Tracking — Core Loop
+# --------------------------
+
+def run_tracking(ip_url: str):
+    """Runs in a background thread. Reads frames from IPWebcam,
+       runs YOLOv8, draws annotations, stores latest frame."""
+    global stream_active, latest_frame, tracking_data
+
+    logger.info(f"Connecting to IPWebcam: {ip_url}")
+    cap = cv2.VideoCapture(ip_url)
+
+    if not cap.isOpened():
+        logger.error("ERROR: Cannot connect to IPWebcam stream")
+        stream_active = False
+        return
+
+    frame_count  = 0
+    ball_missing = 0
+
+    while stream_active:
+        ret, frame = cap.read()
+
+        if not ret:
+            logger.warning("Connection lost, retrying in 2 seconds...")
+            time.sleep(2)
+            cap = cv2.VideoCapture(ip_url)
+            continue
+
+        frame_count  += 1
+        frame_results = []
+        ball_found    = False
+
+        try:
+            results = live_model.predict(frame, conf=0.35, verbose=False)
+
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf  = float(box.conf[0])
+                    cls   = int(box.cls[0])
+                    label = live_model.names[cls]
+                    cx    = (x1 + x2) // 2
+                    cy    = (y1 + y2) // 2
+
+                    if label == "player":
+                        draw_player(frame, x1, y1, x2, y2, conf)
+
+                    elif label == "ball":
+                        draw_ball(frame, x1, y1, x2, y2, conf)
+                        ball_found   = True
+                        ball_missing = 0
+
+                    elif label == "referee":
+                        draw_referee(frame, x1, y1, x2, y2, conf)
+
+                    frame_results.append({
+                        "label":      label,
+                        "confidence": round(conf, 2),
+                        "bbox":       [x1, y1, x2, y2],
+                        "center":     [cx, cy]
+                    })
+
+            # Keep trail visible for 10 frames after ball disappears
+            if not ball_found:
+                ball_missing += 1
+                if ball_missing <= 10:
+                    draw_ball_trail(frame)
+                else:
+                    ball_trail.clear()
+
+            # ── Stats overlay (top-left dark strip) ───────────────────
+            player_count = sum(1 for r in frame_results if r["label"] == "player")
+            h, w         = frame.shape[:2]
+
+            cv2.rectangle(frame, (0, 0), (280, 80), (0, 0, 0), -1)
+            cv2.rectangle(frame, (0, 0), (280, 80), (50, 50, 50),  1)
+
+            cv2.putText(frame, f"Players: {player_count}",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75, COLOR_PLAYER, 2)
+
+            ball_text  = "Ball: Detected" if ball_found else "Ball: Not found"
+            ball_color = COLOR_BALL if ball_found else (100, 100, 100)
+            cv2.putText(frame, ball_text,
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75, ball_color, 2)
+
+            # ── LIVE badge (top-right) ─────────────────────────────────
+            cv2.circle(frame, (w - 30, 20), 8, (0, 0, 255), -1)
+            cv2.putText(frame, "LIVE",
+                        (w - 72, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (0, 0, 255), 2)
+
+            # ── Frame counter (bottom-left) ────────────────────────────
+            cv2.putText(frame, f"Frame: {frame_count}",
+                        (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (150, 150, 150), 1)
+
+        except Exception as e:
+            logger.error(f"Detection error on frame {frame_count}: {e}")
+
+        with frame_lock:
+            latest_frame  = frame.copy()
+            tracking_data = frame_results
+
+    cap.release()
+    ball_trail.clear()
+    logger.info("Live tracking stopped.")
+
+
+# --------------------------
+# Live Tracking — MJPEG Generator
+# --------------------------
+
+def generate_frames():
+    """Yields MJPEG frames for the /live/feed endpoint."""
+    while stream_active:
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.05)
+                continue
+            _, buffer = cv2.imencode(
+                '.jpg', latest_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 85])
+            frame_bytes = buffer.tobytes()
+
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n'
+            + frame_bytes + b'\r\n'
+        )
+        time.sleep(0.033)  # ~30 FPS
+
+
+# --------------------------
+# Video Processing (existing)
+# --------------------------
+
 def process_video(input_video_path):
-    """Processes the video and saves annotated output with player IDs only (referees hidden)."""
+    """Processes the uploaded video and saves annotated output."""
     try:
-        video_name = os.path.splitext(os.path.basename(input_video_path))[0]
+        video_name            = os.path.splitext(os.path.basename(input_video_path))[0]
         output_video_path_avi = os.path.join(output_videos_dir, f"{video_name}.avi")
         output_video_path_mp4 = os.path.join(output_videos_dir, f"{video_name}.mp4")
-        stub_path = f'stubs/{video_name}_track_stubs.pkl'
+        stub_path             = f'stubs/{video_name}_track_stubs.pkl'
 
         print(f"Processing video: {input_video_path}")
         video_frames = read_video(input_video_path)
 
         # Tracker
         tracker = Tracker('models/best1.pt')
-        tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path=stub_path)
+        tracks  = tracker.get_object_tracks(
+            video_frames, read_from_stub=True, stub_path=stub_path)
         tracker.add_position_to_tracks(tracks)
 
         # Camera
-        camera_estimator = CameraMovementEstimator(video_frames[0])
+        camera_estimator          = CameraMovementEstimator(video_frames[0])
         camera_movement_per_frame = camera_estimator.get_camera_movement(
-            video_frames, read_from_stub=True, stub_path='stubs/camera_movement_stub.pkl'
-        )
-        camera_estimator.add_adjust_positions_to_tracks(tracks, camera_movement_per_frame)
+            video_frames, read_from_stub=True,
+            stub_path='stubs/camera_movement_stub.pkl')
+        camera_estimator.add_adjust_positions_to_tracks(
+            tracks, camera_movement_per_frame)
 
         # View transformation
         frame_height, frame_width, _ = video_frames[0].shape
@@ -1210,115 +1433,93 @@ def process_video(input_video_path):
         speed_distance_estimator.add_speed_and_distance_to_tracks(tracks)
 
         # Teams
-        team_assigner = TeamAssigner(device="cuda" if torch.cuda.is_available() else "cpu", video_path=input_video_path)
+        team_assigner = TeamAssigner(
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            video_path=input_video_path)
         team_assigner.load_team_assignments()
+
         for frame_num, player_track in enumerate(tracks['players']):
-            player_ids = list(player_track.keys())
+            player_ids   = list(player_track.keys())
             player_bboxes = [player_track[pid]["bbox"] for pid in player_ids]
-
-            # Extract player crops
-            player_crops = team_assigner.extract_player_crops(video_frames[frame_num], player_bboxes, [1.0]*len(player_ids))
-            features = team_assigner.extract_features(player_ids, player_crops)
+            player_crops  = team_assigner.extract_player_crops(
+                video_frames[frame_num], player_bboxes,
+                [1.0] * len(player_ids))
+            features         = team_assigner.extract_features(player_ids, player_crops)
             reduced_features = team_assigner.reduce_dimensionality(features)
-
-            # Handle mismatch safely
-            min_len = min(len(player_ids), len(reduced_features))
-            if len(player_ids) != len(reduced_features):
-                print(f"⚠️ Mismatch: {len(player_ids)} player IDs but only {len(reduced_features)} feature vectors.")
-            player_ids = player_ids[:min_len]
-            reduced_features = reduced_features[:min_len]
-
-            labels = team_assigner.assign_teams_by_track_id(player_ids, reduced_features, reassign=(frame_num % 30 == 0))
+            labels           = team_assigner.assign_teams_by_track_id(
+                player_ids, reduced_features,
+                reassign=(frame_num % 30 == 0))
             for pid, label in zip(player_ids, labels):
-                player_track[pid]['team'] = label if label is not None else "Unknown"
+                tracks['players'][frame_num][pid]['team'] = label
+                if 'team' not in tracks['players'][frame_num][pid]:
+                    tracks['players'][frame_num][pid]['team'] = "Unknown"
 
         team_assigner.save_team_assignments()
 
         # Ball assignment
-        player_assigner = PlayerBallAssigner()
+        player_assigner  = PlayerBallAssigner()
         team_ball_control = []
+
         for frame_num, player_track in enumerate(tracks['players']):
-            ball_info = tracks['ball'][frame_num] if frame_num < len(tracks['ball']) else {}
-            ball_bbox = ball_info.get(1, {}).get("bbox", None) if isinstance(ball_info, dict) else None
+            ball_info = (tracks['ball'][frame_num]
+                         if frame_num < len(tracks['ball']) else {})
+            ball_bbox = (ball_info.get(1, {}).get("bbox", None)
+                         if isinstance(ball_info, dict) else None)
+
             if not ball_bbox:
                 last_team = team_ball_control[-1] if team_ball_control else "Unknown"
                 team_ball_control.append(last_team)
                 continue
-            assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
+
+            assigned_player = player_assigner.assign_ball_to_player(
+                player_track, ball_bbox)
+
             if assigned_player != -1 and assigned_player in player_track:
-                pdata = player_track[assigned_player]
-                if 'team' not in pdata:
-                    pdata['team'] = 0
-                pdata['has_ball'] = True
-                team_ball_control.append(pdata['team'])
+                player_data = player_track[assigned_player]
+                if 'team' not in player_data:
+                    player_data['team'] = 0
+                player_data['has_ball'] = True
+                team_ball_control.append(player_data['team'])
             else:
                 last_team = team_ball_control[-1] if team_ball_control else "Unknown"
                 team_ball_control.append(last_team)
+
         team_ball_control = np.array(team_ball_control)
 
-        # --------------------------
-        # Draw annotations (player IDs only)
-        # --------------------------
-        output_video_frames = []
-        for frame_num, frame in enumerate(video_frames):
-            frame_copy = frame.copy()
-            player_tracks = tracks['players'][frame_num]
-
-            for pid, pdata in player_tracks.items():
-                # Skip referees
-                if pdata.get('team') == 'referee':
-                    continue
-
-                bbox = pdata.get('bbox', None)
-                if not bbox or len(bbox) != 4:
-                    continue
-                x1, y1, x2, y2 = map(int, bbox)
-                color = (0, 255, 0) if pdata.get('team') == 1 else (0, 0, 255)
-
-                # Draw player rectangle
-                cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
-                # Draw player ID
-                cv2.putText(frame_copy, f"ID:{pid}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                # Draw ball possession
-                if pdata.get('has_ball'):
-                    cv2.circle(frame_copy, ((x1+x2)//2, (y1+y2)//2), 5, (0, 255, 255), -1)
-
-            # Overlay camera movement
-            frame_copy = camera_estimator.draw_camera_movement([frame_copy], [camera_movement_per_frame[frame_num]])[0]
-
-            # Overlay speed and distance safely
-            try:
-                speed_distance_estimator.draw_speed_and_distance([frame_copy], {frame_num: player_tracks})
-            except Exception as e:
-                print(f"⚠️ Skipped speed/distance for frame {frame_num}: {e}")
-
-            output_video_frames.append(frame_copy)
+        # Draw annotations
+        output_video_frames = tracker.draw_annotations(
+            video_frames, tracks, team_ball_control)
+        output_video_frames = camera_estimator.draw_camera_movement(
+            output_video_frames, camera_movement_per_frame)
+        speed_distance_estimator.draw_speed_and_distance(
+            output_video_frames, tracks)
 
         # Save AVI
         save_video(output_video_frames, output_video_path_avi)
 
-        # Convert to MP4
+        # Convert to MP4 if ffmpeg available
         if shutil.which("ffmpeg"):
             try:
-                ffmpeg.input(output_video_path_avi).output(output_video_path_mp4, vcodec="libx264", acodec="aac").overwrite_output().run()
+                ffmpeg.input(output_video_path_avi).output(
+                    output_video_path_mp4,
+                    vcodec="libx264", acodec="aac"
+                ).overwrite_output().run()
                 os.remove(output_video_path_avi)
                 print(f"Saved MP4: {output_video_path_mp4}")
                 return output_video_path_mp4
-            except:
-                print(f"FFmpeg failed, keeping AVI")
+            except Exception:
+                print("FFmpeg failed, keeping AVI")
                 return output_video_path_avi
         else:
             print("FFmpeg not found, keeping AVI")
             return output_video_path_avi
 
     except Exception as e:
-        print(f"❌ Error in processing: {e}")
+        print(f"Error in processing: {e}")
         traceback.print_exc()
         return None
 
-# --------------------------
-# Helper: Video streaming
-# --------------------------
+
 def generate_video_chunks(video_filename, start_byte=0, end_byte=None):
     with open(video_filename, "rb") as f:
         f.seek(start_byte)
@@ -1332,56 +1533,70 @@ def generate_video_chunks(video_filename, start_byte=0, end_byte=None):
                 remaining -= len(chunk)
             yield chunk
 
-# --------------------------
-# API Endpoints
-# --------------------------
+
+# ==========================
+# API Endpoints — Existing
+# ==========================
+
 @app.get("/")
 def root():
-    return {"message": "Server running. Use /docs for API."}
+    return {"message": "GamePlan server running. Use /docs for API."}
+
 
 @app.post("/upload-video/")
-async def upload_video(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+async def upload_video(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
     input_video_path = os.path.join(input_videos_dir, file.filename)
+
     async with aiofiles.open(input_video_path, "wb") as f:
         await f.write(await file.read())
 
-    # Start background processing
     if background_tasks:
         background_tasks.add_task(process_video, input_video_path)
 
     return JSONResponse(
         content={
-            "message": "Video uploaded. Processing in background.",
+            "message":   "Video uploaded. Processing in background.",
             "video_url": f"/output/{file.filename}"
         },
         status_code=202
     )
 
+
 @app.get("/output/{video_filename}")
 async def stream_video(video_filename: str, request: Request):
-    video_path_mp4 = os.path.join(output_videos_dir, f"{os.path.splitext(video_filename)[0]}.mp4")
-    video_path_avi = os.path.join(output_videos_dir, f"{os.path.splitext(video_filename)[0]}.avi")
-    video_path = video_path_mp4 if os.path.exists(video_path_mp4) else video_path_avi
+    video_path_mp4 = os.path.join(
+        output_videos_dir,
+        f"{os.path.splitext(video_filename)[0]}.mp4")
+    video_path_avi = os.path.join(
+        output_videos_dir,
+        f"{os.path.splitext(video_filename)[0]}.avi")
+    video_path = (video_path_mp4
+                  if os.path.exists(video_path_mp4)
+                  else video_path_avi)
 
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video not processed yet.")
 
-    file_size = os.stat(video_path).st_size
+    file_size    = os.stat(video_path).st_size
     range_header = request.headers.get("Range")
-    start, end = 0, file_size - 1
+    start, end   = 0, file_size - 1
+
     if range_header:
         byte_range = range_header.replace("bytes=", "").split("-")
         start = int(byte_range[0])
-        end = int(byte_range[1]) if byte_range[1] else file_size - 1
+        end   = int(byte_range[1]) if byte_range[1] else file_size - 1
 
     headers = {
-        "Content-Type": "video/mp4",
-        "Content-Length": str(end - start + 1),
+        "Content-Type":        "video/mp4",
+        "Content-Length":      str(end - start + 1),
         "Content-Disposition": "inline",
-        "Accept-Ranges": "bytes",
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Vary": "Range",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Accept-Ranges":       "bytes",
+        "Content-Range":       f"bytes {start}-{end}/{file_size}",
+        "Vary":                "Range",
+        "Cache-Control":       "no-cache, no-store, must-revalidate",
     }
 
     return StreamingResponse(
@@ -1390,29 +1605,107 @@ async def stream_video(video_filename: str, request: Request):
         status_code=206 if range_header else 200
     )
 
+
 @app.get("/download/{video_filename}")
 async def download_video(video_filename: str):
-    video_path_mp4 = os.path.join(output_videos_dir, f"{os.path.splitext(video_filename)[0]}.mp4")
-    video_path_avi = os.path.join(output_videos_dir, f"{os.path.splitext(video_filename)[0]}.avi")
-    video_path = video_path_mp4 if os.path.exists(video_path_mp4) else video_path_avi
+    video_path_mp4 = os.path.join(
+        output_videos_dir,
+        f"{os.path.splitext(video_filename)[0]}.mp4")
+    video_path_avi = os.path.join(
+        output_videos_dir,
+        f"{os.path.splitext(video_filename)[0]}.avi")
+    video_path = (video_path_mp4
+                  if os.path.exists(video_path_mp4)
+                  else video_path_avi)
 
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video not found")
 
     async def iterfile():
         async with aiofiles.open(video_path, "rb") as f:
-            while chunk := await f.read(10*1024*1024):
+            while chunk := await f.read(10 * 1024 * 1024):
                 yield chunk
 
     return StreamingResponse(
         iterfile(),
         media_type="video/mp4",
-        headers={"Content-Disposition": f"attachment; filename={os.path.basename(video_path)}"}
+        headers={
+            "Content-Disposition":
+                f"attachment; filename={os.path.basename(video_path)}"
+        }
     )
 
-# --------------------------
-# Run server
-# --------------------------
+
+# ==========================
+# API Endpoints — Live Tracking (NEW)
+# ==========================
+
+@app.post("/live/start")
+def start_live(ip_url: str = "http://192.168.1.5:8080/video"):
+    """Start live player and ball tracking from IPWebcam stream."""
+    global stream_active
+    if stream_active:
+        return {"status": "already running", "ip_url": ip_url}
+
+    stream_active = True
+    thread = threading.Thread(
+        target=run_tracking,
+        args=(ip_url,),
+        daemon=True
+    )
+    thread.start()
+    logger.info(f"Live tracking started: {ip_url}")
+    return {"status": "started", "ip_url": ip_url}
+
+
+@app.post("/live/stop")
+def stop_live():
+    """Stop the live tracking stream."""
+    global stream_active
+    stream_active = False
+    logger.info("Live tracking stopped by user.")
+    return {"status": "stopped"}
+
+
+@app.get("/live/feed")
+def live_feed():
+    """MJPEG stream of the annotated live video feed."""
+    return StreamingResponse(
+        generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.get("/live/status")
+def live_status():
+    """Check whether the live stream is currently active."""
+    return {"active": stream_active}
+
+
+@app.get("/live/data")
+def live_data():
+    """Return current frame tracking data: players, ball, referee."""
+    players  = [d for d in tracking_data if d["label"] == "player"]
+    ball     = next((d for d in tracking_data if d["label"] == "ball"), None)
+    referees = [d for d in tracking_data if d["label"] == "referee"]
+
+    return {
+        "active":        stream_active,
+        "player_count":  len(players),
+        "players":       players,
+        "ball_detected": ball is not None,
+        "ball":          ball,
+        "ball_position": ball["center"] if ball else None,
+        "ball_trail":    list(ball_trail),
+        "referees":      referees,
+        "total_objects": len(tracking_data)
+    }
+
+
+# ==========================
+# Run
+# ==========================
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=300)
 
