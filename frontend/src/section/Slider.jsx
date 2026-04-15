@@ -25,16 +25,7 @@ const slides = [
     image: "/images/slider/confusion.png",
     description: "This is the third slide description.",
   },
-  // {
-  //   title: "Slide 4",
-  //   image: "/images/slide4.jpg",
-  //   description: "This is the fourth slide description.",
-  // },
-  // {
-  //   title: "Slide 5",
-  //   image: "/images/slide5.jpg",
-  //   description: "This is the fifth slide description.",
-  // },
+ 
 ];
 
 const Slider = () => {

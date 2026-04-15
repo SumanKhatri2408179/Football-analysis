@@ -36,7 +36,7 @@ const registerUser = async (userData) => {
 
 const fetchUserProfile = async (token) => {
     try {
-        const response = await axios.get(`${API_URL}/users/me/`, {
+        const response = await axios.get(`${API_URL}/auth/users/me/`, {
             headers: {
                 Authorization: `Bearer ${token}`
             }

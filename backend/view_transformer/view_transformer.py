@@ -5,18 +5,18 @@ import cv2
 class ViewTransformer:
     def __init__(self, image_size):
         # Field dimensions in meters
-        court_width = 68  # Width of the football field
-        court_length = 105  # Length of the football field
+        court_width = 68  
+        court_length = 105  
 
         # Image dimensions
         height, width = image_size
 
         # Dynamically define the polygon vertices for perspective transformation
         self.pixel_vertices = np.array([
-            [int(0.05 * width), height],       # Bottom-left
-            [int(0.25 * width), int(0.1 * height)],  # Top-left
-            [int(0.75 * width), int(0.1 * height)],  # Top-right
-            [int(0.95 * width), height]        # Bottom-right
+            [int(0.05 * width), height],       
+            [int(0.25 * width), int(0.1 * height)],  
+            [int(0.75 * width), int(0.1 * height)],  
+            [int(0.95 * width), height]     
         ]).astype(np.float32)
 
         # Define target vertices (transformed points)
