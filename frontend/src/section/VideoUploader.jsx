@@ -7,7 +7,6 @@ import { Element } from "react-scroll";
 import { API_URL } from "../api";
 import { Copy } from "lucide-react";
 import { useGoogleLogin } from "@react-oauth/google";
-
 import {
   Dialog,
   DialogContent,
@@ -19,8 +18,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-
 import LoginModal from "../components/LoginModal.jsx";
+import PitchRating from "../components/PitchRating.jsx";
 
 const BACKEND_URL = "http://localhost:8000";
 
@@ -39,7 +38,7 @@ const VideoUploader = () => {
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState("");
   const [trackingData, setTrackingData] = useState(null);
-  const [feedKey, setFeedKey] = useState(0); // forces img reload
+  const [feedKey, setFeedKey] = useState(0);
   const dataInterval = useRef(null);
 
   const buttonIcon = { src: "/images/plan-1.png", alt: "button Logo" };
@@ -143,7 +142,7 @@ const VideoUploader = () => {
     setLiveError("");
     try {
       await axios.post(`${BACKEND_URL}/live/start?ip_url=${encodeURIComponent(ipUrl)}`);
-      setFeedKey(prev => prev + 1); // force img tag to reload fresh
+      setFeedKey(prev => prev + 1);
       setIsStreaming(true);
     } catch {
       setLiveError("Cannot connect. Check IP address and make sure phone & PC are on the same WiFi.");
@@ -270,7 +269,7 @@ const VideoUploader = () => {
                       View Processed Video
                     </Button>
                   </DialogTrigger>
-                  <DialogContent className="shad-dialog g7">
+                  <DialogContent className="shad-dialog g7 overflow-y-auto max-h-[90vh]">
                     <DialogHeader>
                       <DialogTitle>Football Analytics Video</DialogTitle>
                       <DialogDescription>
@@ -316,6 +315,13 @@ const VideoUploader = () => {
                         DOWNLOAD
                       </button>
                     </DialogFooter>
+
+                    {/* ← ADDED: Pitch Rating inside dialog below download */}
+                    <div className="mt-4">
+                      <PitchRating videoFilename={outputVideo} />
+                    </div>
+                    {/* ← END ADDED */}
+
                   </DialogContent>
                 </Dialog>
               )}
@@ -324,6 +330,7 @@ const VideoUploader = () => {
                 Video processing may take up to 2 minutes. Feel free to leave
                 this page and come back later!
               </p>
+
             </div>
           </div>
         </div>
@@ -437,17 +444,11 @@ const VideoUploader = () => {
             {/* While streaming — video feed + stats */}
             {isStreaming && (
               <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-
-                {/* ── Live video feed ── */}
                 <div style={{
-                  borderRadius: "10px",
-                  overflow: "hidden",
-                  border: "2px solid #e63946",
-                  background: "#000",
-                  minHeight: "360px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
+                  borderRadius: "10px", overflow: "hidden",
+                  border: "2px solid #e63946", background: "#000",
+                  minHeight: "360px", display: "flex",
+                  alignItems: "center", justifyContent: "center",
                   position: "relative",
                 }}>
                   <img
@@ -455,23 +456,17 @@ const VideoUploader = () => {
                     src={`${BACKEND_URL}/live/feed?t=${feedKey}`}
                     alt="Live tracking feed"
                     style={{
-                      width: "100%",
-                      height: "auto",
-                      display: "block",
-                      minHeight: "360px",
+                      width: "100%", height: "auto",
+                      display: "block", minHeight: "360px",
                       objectFit: "contain",
                     }}
                     onError={(e) => {
                       console.error("Live feed failed to load");
                     }}
                   />
-                  {/* Loading overlay text */}
                   <p style={{
-                    position: "absolute",
-                    color: "#333",
-                    fontSize: "13px",
-                    pointerEvents: "none",
-                    zIndex: 0,
+                    position: "absolute", color: "#333",
+                    fontSize: "13px", pointerEvents: "none", zIndex: 0,
                   }}>
                     Connecting to feed...
                   </p>
@@ -483,34 +478,28 @@ const VideoUploader = () => {
                     <p style={{ color: "#facc15", fontWeight: 700, fontSize: "14px", margin: "0 0 12px 0" }}>
                       Tracking Stats
                     </p>
-
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
                       <span style={{ color: "#8899aa", fontSize: "13px" }}>👤 Players detected</span>
                       <span style={{ color: "#22c55e", fontWeight: 700 }}>{trackingData.player_count ?? 0}</span>
                     </div>
-
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
                       <span style={{ color: "#8899aa", fontSize: "13px" }}>⚽ Ball</span>
                       <span style={{ color: trackingData.ball_detected ? "#facc15" : "#4b5563", fontWeight: 700 }}>
                         {trackingData.ball_detected ? "Detected" : "Not found"}
                       </span>
                     </div>
-
                     {trackingData.ball_detected && trackingData.ball_position && (
                       <p style={{ color: "#4b6080", fontSize: "11px", margin: "0 0 8px 0" }}>
                         Position: ({trackingData.ball_position[0]}, {trackingData.ball_position[1]}) | Conf: {trackingData.ball?.confidence}
                       </p>
                     )}
-
                     {trackingData.referees?.length > 0 && (
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
                         <span style={{ color: "#8899aa", fontSize: "13px" }}>🟠 Referee</span>
                         <span style={{ color: "#fb923c", fontWeight: 700 }}>{trackingData.referees.length}</span>
                       </div>
                     )}
-
                     <hr style={{ border: "none", borderTop: "1px solid #1e3a5f", margin: "10px 0" }} />
-
                     {trackingData.players?.length > 0 && (
                       <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                         {trackingData.players.map((pl, i) => (
@@ -520,7 +509,6 @@ const VideoUploader = () => {
                         ))}
                       </div>
                     )}
-
                     <p style={{ color: "#2a3a4a", fontSize: "11px", margin: "8px 0 0 0" }}>
                       Total objects: {trackingData.total_objects}
                     </p>
@@ -565,4 +553,3 @@ const VideoUploader = () => {
 };
 
 export default VideoUploader;
-
